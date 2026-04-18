@@ -358,8 +358,12 @@ def make_probe_nodes(
     def probe_editor_selfhs(state: SelfieProbeMixin) -> SelfieProbeMixin:
         er = state["editor_result"]
         # draft_start/end were set from answer-only token IDs, so they point
-        # directly at answer positions inside editor's output_ids.
-        draft_positions = list(range(state["editor_draft_start"], state["editor_draft_end"]))
+        # directly at answer positions inside editor's output_ids.  Cap to
+        # hs_len because the final EOS token has no hidden state captured by
+        # inline generate() (loop exits before its forward pass).
+        hs_len = er.hidden_states[-1].shape[1]
+        draft_positions = [t for t in range(state["editor_draft_start"], state["editor_draft_end"])
+                           if t < hs_len]
         num_ph = len(draft_positions)
 
         # Extract the editor's FINAL hidden state at the draft span.
@@ -384,9 +388,13 @@ def make_probe_nodes(
 
     def probe_editor_writerhs(state: SelfieProbeMixin) -> SelfieProbeMixin:
         wr = state["writer_result"]
-        # Positions of the answer tokens (skip any thinking prefix)
+        # Positions of the answer tokens (skip any thinking prefix).  Cap to
+        # hs_len because the final EOS token has no hidden state captured by
+        # inline generate() (loop exits before its forward pass).
+        hs_len = wr.hidden_states[-1].shape[1]
         ans_start = wr.prompt_len + wr.answer_offset
-        writer_out_positions = list(range(ans_start, ans_start + len(wr.gen_token_ids)))
+        writer_out_positions = [t for t in range(ans_start, ans_start + len(wr.gen_token_ids))
+                                if t < hs_len]
         num_ph = len(writer_out_positions)
 
         # Writer's FINAL hidden state at its output positions.
