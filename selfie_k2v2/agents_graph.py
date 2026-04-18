@@ -83,13 +83,15 @@ _EDITOR_USER_INJECT = (
 # ask it to repeat/describe the encoded content.  Tests whether the HS actually
 # carry the information of the original output (sanity check before trusting
 # cross-agent injection in Arm C).
-_WRITER_SELFPROBE_SYSTEM = (
-    "You are a helpful assistant. "
-    "Repeat back the message in <MSG> tags word-for-word."
-)
+#
+# Prompt format mirrors the SELFIE interpretation template (single-quote frame
+# + continuation primer) which is proven to work for hidden-state probing.
+# XML-style tags like <MSG>...</MSG> were tried first but caused the model to
+# fixate on the framing tokens and emit "<MSG><MSG><MSG>..." loops.
+_WRITER_SELFPROBE_SYSTEM = "You are a helpful assistant."
 _WRITER_SELFPROBE_USER = (
-    f"Here is a message:\n<MSG>{_INJECT_MARKER}</MSG>\n"
-    "Please repeat the message exactly as given:"
+    f"The following is a message: '{_INJECT_MARKER}'.\n"
+    "Repeated word-for-word, the message says:"
 )
 
 
