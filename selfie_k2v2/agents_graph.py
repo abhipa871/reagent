@@ -79,6 +79,19 @@ _EDITOR_USER_INJECT = (
     f"Please evaluate this draft:\n<DRAFT>{_INJECT_MARKER}</DRAFT>\nYour feedback:"
 )
 
+# Writer self-probe: inject the writer's own final HS back into the writer and
+# ask it to repeat/describe the encoded content.  Tests whether the HS actually
+# carry the information of the original output (sanity check before trusting
+# cross-agent injection in Arm C).
+_WRITER_SELFPROBE_SYSTEM = (
+    "You are a helpful assistant. "
+    "Repeat back the message in <MSG> tags word-for-word."
+)
+_WRITER_SELFPROBE_USER = (
+    f"Here is a message:\n<MSG>{_INJECT_MARKER}</MSG>\n"
+    "Please repeat the message exactly as given:"
+)
+
 
 # ---------------------------------------------------------------------------
 # State schema
@@ -111,6 +124,9 @@ class SelfieProbeMixin(TypedDict, total=False):
 
     # ── Arm C: writer's hidden states injected into editor ───────────────────
     editor_writerhs_verdict: str
+
+    # ── Writer self-probe: writer's HS injected back into writer ─────────────
+    writer_selfprobe_output: str
 
     # ── SELFIE analyses ───────────────────────────────────────────────────────
     selfie_writer: Optional[pd.DataFrame]           # Exp 1
@@ -414,6 +430,40 @@ def make_probe_nodes(
         )
         return {**state, "editor_writerhs_verdict": verdict}
 
+    # ── Writer self-probe: writer's HS injected back into writer ─────────────
+    # Tests whether the writer can decode its OWN final hidden states back into
+    # the original output.  If the self-probe reconstructs the essay well, the
+    # HS genuinely encode the content (and any divergence between Arm A and
+    # Arm C is due to cross-agent communication, not an encoding limitation).
+
+    def probe_writer_selfprobe(state: SelfieProbeMixin) -> SelfieProbeMixin:
+        wr = state["writer_result"]
+        hs_len = wr.hidden_states[-1].shape[1]
+        ans_start = wr.prompt_len + wr.answer_offset
+        writer_out_positions = [t for t in range(ans_start, ans_start + len(wr.gen_token_ids))
+                                if t < hs_len]
+        num_ph = len(writer_out_positions)
+
+        writer_final_hs = wr.hidden_states[-1][0, writer_out_positions, :]
+
+        prompt_ids, ph_positions = _build_inject_prompt(
+            writer_backend,
+            _INJECT_MARKER,
+            num_ph,
+            system=_WRITER_SELFPROBE_SYSTEM,
+            user_template=_WRITER_SELFPROBE_USER,
+        )
+
+        output = writer_backend.generate_with_injected_embeds(
+            prompt_ids=prompt_ids,
+            placeholder_positions=ph_positions,
+            injected_hidden=writer_final_hs,
+            inject_layer=inject_layer,
+            max_new_tokens=max_writer_tokens,
+            projector=None,  # writer → writer, same space
+        )
+        return {**state, "writer_selfprobe_output": output}
+
     # ── SELFIE on writer's hidden states ─────────────────────────────────────
 
     def probe_selfie_writer(state: SelfieProbeMixin) -> SelfieProbeMixin:
@@ -466,11 +516,12 @@ def make_probe_nodes(
         return {**state, "selfie_editor_on_draft": df}
 
     return {
-        "probe_editor":          probe_editor,
-        "probe_editor_selfhs":   probe_editor_selfhs,
-        "probe_editor_writerhs": probe_editor_writerhs,
-        "probe_selfie_writer":   probe_selfie_writer,
-        "probe_selfie_editor":   probe_selfie_editor,
+        "probe_editor":            probe_editor,
+        "probe_editor_selfhs":     probe_editor_selfhs,
+        "probe_editor_writerhs":   probe_editor_writerhs,
+        "probe_writer_selfprobe":  probe_writer_selfprobe,
+        "probe_selfie_writer":     probe_selfie_writer,
+        "probe_selfie_editor":     probe_selfie_editor,
     }
 
 
@@ -504,11 +555,12 @@ def add_probe_to_graph(
 
     The graph topology added:
         entry_node
-          → probe_editor       (Arm A — raw text, captures HS)
+          → probe_editor            (Arm A — raw text, captures HS)
           → probe_selfie_writer
           → probe_selfie_editor
-          → probe_editor_selfhs   (Arm B — editor's own HS re-injected)
-          → probe_editor_writerhs (Arm C — writer's HS injected)
+          → probe_editor_selfhs     (Arm B — editor's own HS re-injected)
+          → probe_editor_writerhs   (Arm C — writer's HS injected into editor)
+          → probe_writer_selfprobe  (writer's HS injected back into writer)
           → END
     """
     nodes = make_probe_nodes(
@@ -528,6 +580,7 @@ def add_probe_to_graph(
         "probe_selfie_editor",
         "probe_editor_selfhs",
         "probe_editor_writerhs",
+        "probe_writer_selfprobe",
     ]
 
     for name in order:

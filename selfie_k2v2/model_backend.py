@@ -561,9 +561,17 @@ class ModelBackend:
 
             handles.append(layer.register_forward_pre_hook(_pre_hook, with_kwargs=True))
 
+        # IMPORTANT: pass explicit attention_mask of all ones.  Placeholder
+        # positions use pad_token_id; if we let generate() auto-derive the
+        # attention mask it would mask them out, and the rest of the prompt
+        # would never attend to our injected hidden states (the editor would
+        # literally say "the draft is empty").
+        attention_mask = torch.ones_like(prompt_ids)
+
         try:
             out_ids = self.model.generate(
                 input_ids=prompt_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,

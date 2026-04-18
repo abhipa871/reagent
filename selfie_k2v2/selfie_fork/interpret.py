@@ -152,9 +152,16 @@ def _generate_batch_patched(
 
             handles.append(layer.register_forward_pre_hook(_pre_hook, with_kwargs=True))
 
+        # Explicit all-ones attention mask: the placeholder token id (0) may
+        # coincide with the pad_token_id, which would cause generate() to
+        # auto-mask our injected positions.  Forcing ones guarantees the model
+        # attends to them.
+        attention_mask = torch.ones_like(batch_ids)
+
         try:
             out_ids = model.generate(
                 input_ids=batch_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
