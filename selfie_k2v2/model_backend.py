@@ -344,6 +344,10 @@ class ModelBackend:
             ids = self.tokenizer.apply_chat_template(messages, **common, **template_kw)
         except TypeError:
             ids = self.tokenizer.apply_chat_template(messages, **common)
+        # apply_chat_template may return a BatchEncoding (multimodal tokenizers
+        # like Qwen3.5) rather than a plain tensor — always unwrap to input_ids.
+        if hasattr(ids, "input_ids"):
+            ids = ids.input_ids
         return ids.to(self.device)
 
     # ------------------------------------------------------------------
@@ -376,9 +380,10 @@ class ModelBackend:
                                         prompt_len + answer_offset + len(gen_token_ids))
         """
         prompt_ids = prompt_ids.to(self.device)
+        # Unwrap BatchEncoding in case caller passed apply_chat_template output directly
+        if hasattr(prompt_ids, "input_ids"):
+            prompt_ids = prompt_ids.input_ids
         prompt_len = prompt_ids.shape[1]
-
-        out_ids = self.model.generate(
             input_ids=prompt_ids,
             max_new_tokens=max_new_tokens,
             do_sample=False,
