@@ -21,8 +21,7 @@ import time
 import torch
 import pandas as pd
 
-from selfie_k2v2.k2v2_backend import K2V2Backend
-from selfie_k2v2.agents_graph import make_graph
+from selfie_k2v2 import ModelBackend, K2V2Backend, make_graph
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -130,23 +129,24 @@ def main():
     print(f"\nFull graph run took {time.time() - t0:.1f}s.")
 
     # ---------------------------------------------------------------------
-    banner("STEP 4 / 6: Agent outputs (text-level)")
+    banner("STEP 4 / 6: Three-arm comparison")
     # ---------------------------------------------------------------------
     subbanner("WRITER OUTPUT")
     print(final["writer_output_text"])
 
-    subbanner("EDITOR VERDICT — normal (sees writer's text)")
+    subbanner("Arm A — EDITOR VERDICT (raw text)")
     print(final["editor_verdict"])
 
-    subbanner("EDITOR VERDICT — injected (writer's hidden states at placeholders)")
-    print(final["editor_injected_verdict"])
+    subbanner("Arm B — EDITOR VERDICT (editor's own hidden states re-injected)")
+    print(final["editor_selfhs_verdict"])
+
+    subbanner("Arm C — EDITOR VERDICT (writer's hidden states injected)")
+    print(final["editor_writerhs_verdict"])
 
     print()
-    print("Compare the two verdicts above.")
-    print("  - If nearly identical: writer's final hidden states carry roughly the")
-    print("    same info as its surface tokens.")
-    print("  - If very different / injected is garbled: try inject_layer=1 or a")
-    print("    middle layer in agents_graph.injected_editor_node.")
+    print("A ≈ B  →  editor's internal repr and surface text carry the same info.")
+    print("A ≈ C  →  writer's hidden states carry the same info as its text.")
+    print("B ≈ C  →  writer and editor form compatible internal representations.")
 
     # ---------------------------------------------------------------------
     banner("STEP 5 / 6: Experiment 1 — SELFIE on WRITER hidden states")
@@ -204,10 +204,12 @@ def main():
     with open(os.path.join(out_dir, "texts.txt"), "w") as f:
         f.write("=== writer_output_text ===\n")
         f.write(final["writer_output_text"] + "\n\n")
-        f.write("=== editor_verdict (normal) ===\n")
+        f.write("=== Arm A: editor_verdict (raw text) ===\n")
         f.write(final["editor_verdict"] + "\n\n")
-        f.write("=== editor_injected_verdict ===\n")
-        f.write(final["editor_injected_verdict"] + "\n")
+        f.write("=== Arm B: editor_selfhs_verdict ===\n")
+        f.write(final["editor_selfhs_verdict"] + "\n\n")
+        f.write("=== Arm C: editor_writerhs_verdict ===\n")
+        f.write(final["editor_writerhs_verdict"] + "\n")
 
     print()
     print(f"CSVs and raw texts written to: {out_dir}/")

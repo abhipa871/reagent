@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "SELFIE interpretation on K2-V2 writer/editor LangGraph agents"
 requires-python = ">=3.10"
 dependencies = [
-    "transformers>=4.45,<4.60",
+    "transformers>=4.45",
     "accelerate",
     "bitsandbytes",
     "langgraph",
