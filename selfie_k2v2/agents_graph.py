@@ -140,12 +140,18 @@ def _find_sublist(haystack: List[int], needle: List[int]) -> int:
 
 
 def _probe_layers(num_layers: int) -> List[int]:
-    """Pick three representative probe layers (early-mid, mid, late)."""
-    if num_layers >= 60:
-        return [num_layers // 4, num_layers // 2, (3 * num_layers) // 4]
+    """Pick two representative probe layers (mid and late)."""
     if num_layers >= 20:
-        return [num_layers // 3, num_layers // 2, (2 * num_layers) // 3]
-    return [max(1, num_layers // 2)]
+        return [num_layers // 2, (3 * num_layers) // 4]
+    return [max(1, num_layers - 1)]
+
+
+def _sample_positions(positions: List[int], max_n: int) -> List[int]:
+    """Evenly subsample `positions` to at most `max_n` entries."""
+    if len(positions) <= max_n:
+        return positions
+    step = len(positions) / max_n
+    return [positions[int(i * step)] for i in range(max_n)]
 
 
 def _split_prompt_at_marker(
@@ -235,6 +241,8 @@ def make_probe_nodes(
     max_editor_tokens: int = 60,
     selfie_max_new_tokens: int = 15,
     inject_layer: int = 0,
+    run_selfie: bool = True,
+    selfie_max_positions: int = 8,
 ) -> Dict[str, Any]:
     """
     Build all probe node functions and return them as a dict.
@@ -359,10 +367,19 @@ def make_probe_nodes(
     # ── SELFIE on writer's hidden states ─────────────────────────────────────
 
     def probe_selfie_writer(state: SelfieProbeMixin) -> SelfieProbeMixin:
+        if not run_selfie:
+            return {**state, "selfie_writer": pd.DataFrame(
+                columns=["layer", "token_idx", "token", "interpretation"]
+            )}
         wr = state["writer_result"]
-        # Positions of the answer tokens inside output_ids (skip any thinking prefix)
+        # Positions of the answer tokens inside output_ids (skip any thinking prefix).
+        # Cap to hs.shape[1]-1 because the final EOS token has no hidden state
+        # recorded by the inline generate() capture (loop exits before its fwd pass).
+        hs_len = wr.hidden_states[0].shape[1]
         ans_start = wr.prompt_len + wr.answer_offset
-        out_positions = list(range(ans_start, ans_start + len(wr.gen_token_ids)))
+        raw_positions = [t for t in range(ans_start, ans_start + len(wr.gen_token_ids))
+                         if t < hs_len]
+        out_positions = _sample_positions(raw_positions, selfie_max_positions)
         probe_layers = _probe_layers(writer_backend.num_layers)
         positions = [(L, t) for L in probe_layers for t in out_positions]
 
@@ -377,9 +394,16 @@ def make_probe_nodes(
     # ── SELFIE on editor's hidden states at the draft span ───────────────────
 
     def probe_selfie_editor(state: SelfieProbeMixin) -> SelfieProbeMixin:
+        if not run_selfie:
+            return {**state, "selfie_editor_on_draft": pd.DataFrame(
+                columns=["layer", "token_idx", "token", "interpretation"]
+            )}
         er = state["editor_result"]
+        hs_len = er.hidden_states[0].shape[1]
         # draft_start/end align with answer-only token positions in output_ids
-        draft_positions = list(range(state["editor_draft_start"], state["editor_draft_end"]))
+        raw_positions = [t for t in range(state["editor_draft_start"], state["editor_draft_end"])
+                         if t < hs_len]
+        draft_positions = _sample_positions(raw_positions, selfie_max_positions)
         probe_layers = _probe_layers(editor_backend.num_layers)
         positions = [(L, t) for L in probe_layers for t in draft_positions]
 
@@ -413,6 +437,8 @@ def add_probe_to_graph(
     max_editor_tokens: int = 60,
     selfie_max_new_tokens: int = 15,
     inject_layer: int = 0,
+    run_selfie: bool = True,
+    selfie_max_positions: int = 8,
 ) -> StateGraph:
     """
     Attach all probe nodes to `graph` as a linear chain starting from
@@ -442,6 +468,8 @@ def add_probe_to_graph(
         max_editor_tokens=max_editor_tokens,
         selfie_max_new_tokens=selfie_max_new_tokens,
         inject_layer=inject_layer,
+        run_selfie=run_selfie,
+        selfie_max_positions=selfie_max_positions,
     )
 
     order = [
@@ -470,6 +498,8 @@ def make_graph(
     max_editor_tokens: int = 60,
     selfie_max_new_tokens: int = 15,
     inject_layer: int = 0,
+    run_selfie: bool = False,
+    selfie_max_positions: int = 8,
 ):
     """
     Build and compile a complete standalone graph:
@@ -522,6 +552,8 @@ def make_graph(
         max_editor_tokens=max_editor_tokens,
         selfie_max_new_tokens=selfie_max_new_tokens,
         inject_layer=inject_layer,
+        run_selfie=run_selfie,
+        selfie_max_positions=selfie_max_positions,
     )
 
     return g.compile()
