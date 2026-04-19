@@ -260,6 +260,8 @@ def make_probe_nodes(
     max_writer_selfprobe_tokens: int = 80,
     inject_layer: int = 0,
     editor_system: Optional[str] = None,
+    editor_user_text: Optional[str] = None,
+    editor_inject_user_text: Optional[str] = None,
     writer_selfprobe_system: Optional[str] = None,
     writer_selfprobe_user: Optional[str] = None,
     run_comm_gap: bool = True,
@@ -290,6 +292,16 @@ def make_probe_nodes(
         `<<<INJECT_HERE>>>` marker — that's where the writer's HS are spliced.
         Defaults to DEFAULT_WRITER_SELFPROBE_SYSTEM / DEFAULT_WRITER_SELFPROBE_USER
         (a "repeat this message" reconstruction prompt).
+    editor_user_text : str, optional
+        User-turn template for the **text channel** (Arm A).  Must contain
+        exactly one `<<<DRAFT_TOKENS>>>` marker where the writer's decoded text
+        is spliced in.  Defaults to the built-in "evaluate this draft" prompt.
+        Override for domain-specific tasks, e.g. a negotiation reply prompt.
+    editor_inject_user_text : str, optional
+        User-turn template for the **injection channel** (Arms B, C, CG latent).
+        Must contain exactly one `<<<INJECT_HERE>>>` marker.
+        Defaults to the built-in injection prompt (mirrors editor_user_text
+        with the inject marker).  Should match editor_user_text semantically.
     run_comm_gap : bool
         Whether to include the probe_comm_gap node in the returned dict.
         Adds ~2 fast forward passes per invoke() (no generation loop).
@@ -310,6 +322,20 @@ def make_probe_nodes(
     projector = HiddenStateProjector.between(writer_backend, editor_backend)
 
     ed_system = editor_system if editor_system is not None else DEFAULT_EDITOR_SYSTEM
+    ed_user_text = editor_user_text if editor_user_text is not None else _EDITOR_USER_TEXT
+    ed_inject_user_text = editor_inject_user_text if editor_inject_user_text is not None else _EDITOR_USER_INJECT
+
+    if _DRAFT_MARKER not in ed_user_text:
+        raise ValueError(
+            f"editor_user_text must contain exactly one {_DRAFT_MARKER!r} marker "
+            "indicating where the writer's decoded text should be spliced."
+        )
+    if _INJECT_MARKER not in ed_inject_user_text:
+        raise ValueError(
+            f"editor_inject_user_text must contain exactly one {_INJECT_MARKER!r} marker "
+            "indicating where the injected hidden states should be placed."
+        )
+
     wsp_system = writer_selfprobe_system if writer_selfprobe_system is not None \
         else DEFAULT_WRITER_SELFPROBE_SYSTEM
     wsp_user = writer_selfprobe_user if writer_selfprobe_user is not None \
@@ -335,7 +361,7 @@ def make_probe_nodes(
     # ── Arm A: editor sees the raw essay text ────────────────────────────────
     def probe_editor(state: ProbeMixin) -> ProbeMixin:
         pre_ids, post_ids = _split_prompt_at_marker(
-            editor_backend, ed_system, _EDITOR_USER_TEXT, _DRAFT_MARKER
+            editor_backend, ed_system, ed_user_text, _DRAFT_MARKER
         )
 
         writer_toks = state["writer_output_token_ids"]
@@ -387,7 +413,7 @@ def make_probe_nodes(
 
         prompt_ids, ph_positions = _build_inject_prompt(
             editor_backend, num_ph,
-            system=ed_system, user=_EDITOR_USER_INJECT, marker=_INJECT_MARKER,
+            system=ed_system, user=ed_inject_user_text, marker=_INJECT_MARKER,
         )
 
         verdict = editor_backend.generate_with_injected_embeds(
@@ -412,7 +438,7 @@ def make_probe_nodes(
 
         prompt_ids, ph_positions = _build_inject_prompt(
             editor_backend, num_ph,
-            system=ed_system, user=_EDITOR_USER_INJECT, marker=_INJECT_MARKER,
+            system=ed_system, user=ed_inject_user_text, marker=_INJECT_MARKER,
         )
 
         verdict = editor_backend.generate_with_injected_embeds(
@@ -491,7 +517,7 @@ def make_probe_nodes(
 
         lat_prompt_ids, ph_positions = _build_inject_prompt(
             editor_backend, num_ph,
-            system=ed_system, user=_EDITOR_USER_INJECT, marker=_INJECT_MARKER,
+            system=ed_system, user=ed_inject_user_text, marker=_INJECT_MARKER,
         )
         prompt_len_lat = lat_prompt_ids.shape[1]
         full_ids_lat = torch.cat([lat_prompt_ids, ref_resp], dim=1)
@@ -531,6 +557,8 @@ def add_probe_to_graph(
     max_writer_selfprobe_tokens: int = 80,
     inject_layer: int = 0,
     editor_system: Optional[str] = None,
+    editor_user_text: Optional[str] = None,
+    editor_inject_user_text: Optional[str] = None,
     writer_selfprobe_system: Optional[str] = None,
     writer_selfprobe_user: Optional[str] = None,
     run_comm_gap: bool = True,
@@ -557,6 +585,8 @@ def add_probe_to_graph(
         max_writer_selfprobe_tokens=max_writer_selfprobe_tokens,
         inject_layer=inject_layer,
         editor_system=editor_system,
+        editor_user_text=editor_user_text,
+        editor_inject_user_text=editor_inject_user_text,
         writer_selfprobe_system=writer_selfprobe_system,
         writer_selfprobe_user=writer_selfprobe_user,
         run_comm_gap=run_comm_gap,
@@ -591,6 +621,8 @@ def make_graph(
     inject_layer: int = 0,
     writer_system: Optional[str] = None,
     editor_system: Optional[str] = None,
+    editor_user_text: Optional[str] = None,
+    editor_inject_user_text: Optional[str] = None,
     writer_selfprobe_system: Optional[str] = None,
     writer_selfprobe_user: Optional[str] = None,
     run_comm_gap: bool = True,
@@ -647,6 +679,8 @@ def make_graph(
         max_writer_selfprobe_tokens=max_writer_selfprobe_tokens,
         inject_layer=inject_layer,
         editor_system=editor_system,
+        editor_user_text=editor_user_text,
+        editor_inject_user_text=editor_inject_user_text,
         writer_selfprobe_system=writer_selfprobe_system,
         writer_selfprobe_user=writer_selfprobe_user,
         run_comm_gap=run_comm_gap,
