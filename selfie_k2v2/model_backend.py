@@ -344,6 +344,20 @@ class ModelBackend:
             ids = self.tokenizer.apply_chat_template(messages, **common, **template_kw)
         except TypeError:
             ids = self.tokenizer.apply_chat_template(messages, **common)
+        except Exception as e:
+            if system and "system role not supported" in str(e).lower():
+                # Gemma 2 and similar models don't support a system role;
+                # fold the system prompt into the first user message instead.
+                merged_user = f"{system}\n\n{user}"
+                fallback_messages = [{"role": "user", "content": merged_user}]
+                try:
+                    ids = self.tokenizer.apply_chat_template(
+                        fallback_messages, **common, **template_kw
+                    )
+                except TypeError:
+                    ids = self.tokenizer.apply_chat_template(fallback_messages, **common)
+            else:
+                raise
         # apply_chat_template may return a BatchEncoding (multimodal tokenizers
         # like Qwen3.5) rather than a plain tensor — always unwrap to input_ids.
         if hasattr(ids, "input_ids"):
