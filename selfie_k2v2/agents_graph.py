@@ -55,6 +55,7 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict
 import torch
 from langgraph.graph import END, StateGraph
 
+from .metrics import communication_gap
 from .model_backend import GenerationResult, HiddenStateProjector, ModelBackend
 
 
@@ -146,6 +147,9 @@ class ProbeMixin(TypedDict, total=False):
 
     # Arm D: writer's own HS re-injected into the writer (self-probe)
     writer_selfhs_output: str
+
+    # Communication Gap metric (text channel vs. latent channel, teacher-forced)
+    comm_gap: Dict[str, Any]
 
 
 # Backwards-compat alias so existing imports keep working
@@ -256,16 +260,23 @@ def make_probe_nodes(
     max_writer_selfprobe_tokens: int = 80,
     inject_layer: int = 0,
     editor_system: Optional[str] = None,
+    editor_user_text: Optional[str] = None,
+    editor_inject_user_text: Optional[str] = None,
     writer_selfprobe_system: Optional[str] = None,
     writer_selfprobe_user: Optional[str] = None,
+    run_comm_gap: bool = True,
+    cg_alpha: float = 0.5,
+    cg_beta: float = 0.5,
     verbose_timing: bool = False,
 ) -> Dict[str, Any]:
     """
-    Build the four probe nodes and return them as a dict:
+    Build the probe nodes and return them as a dict:
       "probe_editor"          → Arm A (raw text → editor, captures editor HS for Arm B)
       "probe_editor_selfhs"   → Arm B (editor's own draft HS re-injected)
       "probe_editor_writerhs" → Arm C (writer's answer HS injected into editor)
       "probe_writer_selfhs"   → Arm D (writer's answer HS re-injected into writer)
+      "probe_comm_gap"        → Communication Gap metric (Arm A vs Arm C logits,
+                                 teacher-forced).  Included iff run_comm_gap=True.
 
     Parameters
     ----------
@@ -281,6 +292,22 @@ def make_probe_nodes(
         `<<<INJECT_HERE>>>` marker — that's where the writer's HS are spliced.
         Defaults to DEFAULT_WRITER_SELFPROBE_SYSTEM / DEFAULT_WRITER_SELFPROBE_USER
         (a "repeat this message" reconstruction prompt).
+    editor_user_text : str, optional
+        User-turn template for the **text channel** (Arm A).  Must contain
+        exactly one `<<<DRAFT_TOKENS>>>` marker where the writer's decoded text
+        is spliced in.  Defaults to the built-in "evaluate this draft" prompt.
+        Override for domain-specific tasks, e.g. a negotiation reply prompt.
+    editor_inject_user_text : str, optional
+        User-turn template for the **injection channel** (Arms B, C, CG latent).
+        Must contain exactly one `<<<INJECT_HERE>>>` marker.
+        Defaults to the built-in injection prompt (mirrors editor_user_text
+        with the inject marker).  Should match editor_user_text semantically.
+    run_comm_gap : bool
+        Whether to include the probe_comm_gap node in the returned dict.
+        Adds ~2 fast forward passes per invoke() (no generation loop).
+    cg_alpha, cg_beta : float
+        Weights on the cosine and JS terms of the Communication Gap metric.
+        CG = mean_t (cg_beta * JS_t + cg_alpha * COS_t).
     verbose_timing : bool
         Print wall-clock time per arm so you can see where time goes.
 
@@ -289,11 +316,26 @@ def make_probe_nodes(
         editor_prompt_ids, editor_draft_start, editor_draft_end,
         editor_result, editor_verdict,
         editor_selfhs_verdict, editor_writerhs_verdict,
-        writer_selfhs_output
+        writer_selfhs_output,
+        comm_gap  (if run_comm_gap)
     """
     projector = HiddenStateProjector.between(writer_backend, editor_backend)
 
     ed_system = editor_system if editor_system is not None else DEFAULT_EDITOR_SYSTEM
+    ed_user_text = editor_user_text if editor_user_text is not None else _EDITOR_USER_TEXT
+    ed_inject_user_text = editor_inject_user_text if editor_inject_user_text is not None else _EDITOR_USER_INJECT
+
+    if _DRAFT_MARKER not in ed_user_text:
+        raise ValueError(
+            f"editor_user_text must contain exactly one {_DRAFT_MARKER!r} marker "
+            "indicating where the writer's decoded text should be spliced."
+        )
+    if _INJECT_MARKER not in ed_inject_user_text:
+        raise ValueError(
+            f"editor_inject_user_text must contain exactly one {_INJECT_MARKER!r} marker "
+            "indicating where the injected hidden states should be placed."
+        )
+
     wsp_system = writer_selfprobe_system if writer_selfprobe_system is not None \
         else DEFAULT_WRITER_SELFPROBE_SYSTEM
     wsp_user = writer_selfprobe_user if writer_selfprobe_user is not None \
@@ -319,7 +361,7 @@ def make_probe_nodes(
     # ── Arm A: editor sees the raw essay text ────────────────────────────────
     def probe_editor(state: ProbeMixin) -> ProbeMixin:
         pre_ids, post_ids = _split_prompt_at_marker(
-            editor_backend, ed_system, _EDITOR_USER_TEXT, _DRAFT_MARKER
+            editor_backend, ed_system, ed_user_text, _DRAFT_MARKER
         )
 
         writer_toks = state["writer_output_token_ids"]
@@ -371,7 +413,7 @@ def make_probe_nodes(
 
         prompt_ids, ph_positions = _build_inject_prompt(
             editor_backend, num_ph,
-            system=ed_system, user=_EDITOR_USER_INJECT, marker=_INJECT_MARKER,
+            system=ed_system, user=ed_inject_user_text, marker=_INJECT_MARKER,
         )
 
         verdict = editor_backend.generate_with_injected_embeds(
@@ -396,7 +438,7 @@ def make_probe_nodes(
 
         prompt_ids, ph_positions = _build_inject_prompt(
             editor_backend, num_ph,
-            system=ed_system, user=_EDITOR_USER_INJECT, marker=_INJECT_MARKER,
+            system=ed_system, user=ed_inject_user_text, marker=_INJECT_MARKER,
         )
 
         verdict = editor_backend.generate_with_injected_embeds(
@@ -434,12 +476,72 @@ def make_probe_nodes(
         )
         return {**state, "writer_selfhs_output": output}
 
-    return {
+    # ── Communication Gap: Arm A (text) vs Arm C (latent), teacher-forced ────
+    def probe_comm_gap(state: ProbeMixin) -> ProbeMixin:
+        """
+        Score both channels on the SAME reference response (Arm A's verdict),
+        then compute the Communication Gap metric on their logits.
+
+        Teacher forcing is critical here: without it, each channel's logits
+        at step t would be conditioned on its own previously-generated prefix,
+        and divergence would be dominated by prefix drift rather than by the
+        channel difference we actually want to measure.
+        """
+        er = state["editor_result"]
+        wr = state["writer_result"]
+
+        # Reference response tokens = Arm A's generated continuation (the
+        # tokens AFTER the editor prompt).  Use the full raw generation so
+        # we don't drop any tokens to thinking-block post-processing.
+        prompt_len_text = state["editor_prompt_ids"].shape[1]
+        ref_resp = er.output_ids[:, prompt_len_text:].to(editor_backend.device)
+
+        if ref_resp.shape[1] == 0:
+            # No response to score against (editor produced nothing) —
+            # skip the metric gracefully.
+            return {**state, "comm_gap": {"CG": float("nan"), "T": 0, "note": "empty reference response"}}
+
+        # ── Text channel: plain teacher-forced forward pass ──────────────────
+        full_ids_text = torch.cat([state["editor_prompt_ids"], ref_resp], dim=1)
+        logits_text = editor_backend.forward_plain(
+            full_ids=full_ids_text,
+            prompt_len=prompt_len_text,
+        )
+
+        # ── Latent channel: rebuild the injection prompt, then append the
+        #    exact same reference response and do a patched forward pass. ────
+        ans_start = wr.prompt_len + wr.answer_offset
+        writer_out_positions = list(range(ans_start, ans_start + len(wr.gen_token_ids)))
+        num_ph = len(writer_out_positions)
+        writer_final_hs = wr.hidden_states[-1][0, writer_out_positions, :]
+
+        lat_prompt_ids, ph_positions = _build_inject_prompt(
+            editor_backend, num_ph,
+            system=ed_system, user=ed_inject_user_text, marker=_INJECT_MARKER,
+        )
+        prompt_len_lat = lat_prompt_ids.shape[1]
+        full_ids_lat = torch.cat([lat_prompt_ids, ref_resp], dim=1)
+        logits_lat = editor_backend.forward_with_injected_embeds(
+            full_ids=full_ids_lat,
+            prompt_len=prompt_len_lat,
+            placeholder_positions=ph_positions,
+            injected_hidden=writer_final_hs,
+            inject_layer=inject_layer,
+            projector=projector if projector.needs_projection else None,
+        )
+
+        cg = communication_gap(logits_lat, logits_text, alpha=cg_alpha, beta=cg_beta)
+        return {**state, "comm_gap": cg}
+
+    built = {
         "probe_editor":          _timed("probe_editor",          probe_editor),
         "probe_editor_selfhs":   _timed("probe_editor_selfhs",   probe_editor_selfhs),
         "probe_editor_writerhs": _timed("probe_editor_writerhs", probe_editor_writerhs),
         "probe_writer_selfhs":   _timed("probe_writer_selfhs",   probe_writer_selfhs),
     }
+    if run_comm_gap:
+        built["probe_comm_gap"] = _timed("probe_comm_gap", probe_comm_gap)
+    return built
 
 
 # ---------------------------------------------------------------------------
@@ -455,12 +557,17 @@ def add_probe_to_graph(
     max_writer_selfprobe_tokens: int = 80,
     inject_layer: int = 0,
     editor_system: Optional[str] = None,
+    editor_user_text: Optional[str] = None,
+    editor_inject_user_text: Optional[str] = None,
     writer_selfprobe_system: Optional[str] = None,
     writer_selfprobe_user: Optional[str] = None,
+    run_comm_gap: bool = True,
+    cg_alpha: float = 0.5,
+    cg_beta: float = 0.5,
     verbose_timing: bool = False,
 ) -> StateGraph:
     """
-    Attach the 4 probe nodes to `graph` as a linear chain starting from
+    Attach the probe nodes to `graph` as a linear chain starting from
     `entry_node`.  Final node edges to END.
 
         entry_node
@@ -468,6 +575,7 @@ def add_probe_to_graph(
           → probe_editor_selfhs     (Arm B)
           → probe_editor_writerhs   (Arm C)
           → probe_writer_selfhs     (Arm D)
+          → probe_comm_gap          (CG metric, iff run_comm_gap)
           → END
     """
     nodes = make_probe_nodes(
@@ -477,8 +585,13 @@ def add_probe_to_graph(
         max_writer_selfprobe_tokens=max_writer_selfprobe_tokens,
         inject_layer=inject_layer,
         editor_system=editor_system,
+        editor_user_text=editor_user_text,
+        editor_inject_user_text=editor_inject_user_text,
         writer_selfprobe_system=writer_selfprobe_system,
         writer_selfprobe_user=writer_selfprobe_user,
+        run_comm_gap=run_comm_gap,
+        cg_alpha=cg_alpha,
+        cg_beta=cg_beta,
         verbose_timing=verbose_timing,
     )
 
@@ -488,6 +601,8 @@ def add_probe_to_graph(
         "probe_editor_writerhs",
         "probe_writer_selfhs",
     ]
+    if run_comm_gap:
+        order.append("probe_comm_gap")
     for name in order:
         graph.add_node(name, nodes[name])
     graph.add_edge(entry_node, order[0])
@@ -506,16 +621,23 @@ def make_graph(
     inject_layer: int = 0,
     writer_system: Optional[str] = None,
     editor_system: Optional[str] = None,
+    editor_user_text: Optional[str] = None,
+    editor_inject_user_text: Optional[str] = None,
     writer_selfprobe_system: Optional[str] = None,
     writer_selfprobe_user: Optional[str] = None,
+    run_comm_gap: bool = True,
+    cg_alpha: float = 0.5,
+    cg_beta: float = 0.5,
     verbose_timing: bool = False,
 ):
     """
     Build and compile a complete standalone graph:
         writer → probe_editor (A) → probe_editor_selfhs (B)
-               → probe_editor_writerhs (C) → probe_writer_selfhs (D) → END
+               → probe_editor_writerhs (C) → probe_writer_selfhs (D)
+               → probe_comm_gap (CG metric) → END
 
-    Cost: 5 generate() calls per invoke().
+    Cost: 5 generate() calls + 2 fast forward passes per invoke()
+    (drop to 5 generate() calls by passing run_comm_gap=False).
 
     Returns a compiled LangGraph app; call with:
         final = app.invoke({"task": "your task here"})
@@ -557,8 +679,13 @@ def make_graph(
         max_writer_selfprobe_tokens=max_writer_selfprobe_tokens,
         inject_layer=inject_layer,
         editor_system=editor_system,
+        editor_user_text=editor_user_text,
+        editor_inject_user_text=editor_inject_user_text,
         writer_selfprobe_system=writer_selfprobe_system,
         writer_selfprobe_user=writer_selfprobe_user,
+        run_comm_gap=run_comm_gap,
+        cg_alpha=cg_alpha,
+        cg_beta=cg_beta,
         verbose_timing=verbose_timing,
     )
 
