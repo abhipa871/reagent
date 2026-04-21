@@ -194,6 +194,16 @@ def _split_prompt_at_marker(
         full_text: str = tok.apply_chat_template(messages, **common, **template_kw)
     except TypeError:
         full_text = tok.apply_chat_template(messages, **common)
+    except Exception as e:
+        if system and "system role not supported" in str(e).lower():
+            merged_user = f"{system}\n\n{user}"
+            fallback_messages = [{"role": "user", "content": merged_user}]
+            try:
+                full_text = tok.apply_chat_template(fallback_messages, **common, **template_kw)
+            except TypeError:
+                full_text = tok.apply_chat_template(fallback_messages, **common)
+        else:
+            raise
 
     if marker not in full_text:
         raise RuntimeError(
